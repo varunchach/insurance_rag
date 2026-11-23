@@ -1,0 +1,39 @@
+{
+  "storage_secret": "rag-sample-storage",
+  "storage_endpoint": "https://YOUR-APPROVED-S3-ENDPOINT",
+  "bucket": "rag-artifacts",
+  "runtime_image": "YOUR-REGISTRY/rag-docling-gpu@sha256:REPLACE_WITH_DIGEST",
+  "code_configmap": "rag-qualification-code-v1",
+  "cell_matching": true,
+  "cpu_threads": 4,
+  "chunk_budgets": [
+    256,
+    512
+  ],
+  "primary_chunk_budget": 512,
+  "accelerator": "cuda",
+  "preservation": {
+    "rule_width": 1.0,
+    "table_match_iou": 0.95,
+    "native_margin": 2.0,
+    "continuation_edge": 0.72,
+    "continuation_top": 0.23,
+    "expansion_tokens": 4096,
+    "expansion_hops": 2,
+    "note_gap": 12.0,
+    "nested_table_overlap": 0.5,
+    "missing_table_iou": 0.1,
+    "minimum_text_retention": 0.95,
+    "native_table_overlap": 0.8,
+    "note_overlap": 0.8,
+    "continuation_width_tolerance": 0.04
+  },
+  "input_policy": {
+    "max_source_bytes": 104857600,
+    "max_pages": 1000,
+    "min_native_chars": 20,
+    "review_image_area_ratio": 0.05
+  },
+  "model_path": "/opt/rag/models",
+  "tokenizer_path": "/opt/rag/models/tokenizer"
+}

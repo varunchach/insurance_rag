@@ -38,11 +38,12 @@ def pipeline():
         native_artifact=n.outputs["native"]
     if CONFIG.get("parsed_artifact_uri"):
         saved=dsl.importer(artifact_uri=CONFIG["parsed_artifact_uri"],artifact_class=Artifact,reimport=False)
-        p=reconcile_parse(parsed=saved.output).set_cpu_request("1").set_cpu_limit("2").set_memory_request("2Gi").set_memory_limit("4Gi").set_caching_options(False)
-        parsed_artifact=p.outputs["reconciled"]
+        parsed_artifact=saved.output
     else:
         p=docling_parse().set_cpu_request("4").set_cpu_limit("4").set_memory_request("8Gi").set_memory_limit("16Gi").set_accelerator_type("nvidia.com/gpu").set_accelerator_limit(1).set_caching_options(False)
         parsed_artifact=p.outputs["parsed"]
+    repaired=reconcile_parse(parsed=parsed_artifact).set_cpu_request("1").set_cpu_limit("2").set_memory_request("2Gi").set_memory_limit("4Gi").set_caching_options(False)
+    parsed_artifact=repaired.outputs["reconciled"]
     c=context_chunks(parsed=parsed_artifact).set_cpu_request("1").set_cpu_limit("2").set_memory_request("2Gi").set_memory_limit("8Gi").set_caching_options(False)
     qualification_score(native=native_artifact,parsed=parsed_artifact,chunks=c.outputs["chunks"]).set_cpu_request("1").set_cpu_limit("2").set_memory_request("2Gi").set_memory_limit("4Gi").set_caching_options(False)
 OUT.mkdir(parents=True,exist_ok=True)
