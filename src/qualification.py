@@ -2,6 +2,7 @@
 import argparse, base64, collections, hashlib, importlib.metadata as md
 import json, logging, os, re, shutil, ssl, subprocess, sys, time, urllib.request
 from pathlib import Path
+from document_contract import (validate_source, bind_runtime_source, verify_artifact, verify_chunk_binding, seal_manifest, inspect_pdf, policy)
 
 def dump(path, value):
     Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -41,15 +42,19 @@ def fetch(client, config, key, target, expected=None):
     return actual
 
 def get_source(config, output):
+    validate_source(config)
     source = output/"source.pdf"
-    fetch(storage(config), config, config["source_key"], source, config["source_sha256"])
+    client=storage(config)
+    size=client.head_object(Bucket=config["bucket"],Key=config["source_key"])["ContentLength"]
+    if size>policy(config)["max_source_bytes"]:raise ValueError("Source exceeds configured byte limit")
+    fetch(client, config, config["source_key"], source, config["source_sha256"])
     return source
 
 def get_kit_file(client, config, name, target):
     return fetch(client, config, config["kit_prefix"] + name, target, config["kit_hashes"][name])
 
 def runtime_manifest(config, stage):
-    return {"stage":stage, "source_sha256":config["source_sha256"],
+    return {"stage":stage, "source_sha256":config["source_sha256"], "document_id":config.get("document_id"),
         "runtime_image": config["runtime_image"],
         "versions":{n:md.version(n) for n in ["docling","docling-core","docling-ibm-models","pypdf","pdfplumber","PyMuPDF","torch","torchvision","transformers","kfp"]},
         "model_manifest":json.loads(Path("/opt/rag/model-manifest.json").read_text()),
@@ -64,10 +69,10 @@ def native(config, out):
         subprocess.run([sys.executable,str(script),str(source),"--output",str(out)],stdout=log,stderr=subprocess.STDOUT,check=True)
     manifest = runtime_manifest(config, "native")
     manifest["page_count"] = json.loads((out/"profile.json").read_text())["page_count"]
-    dump(out/"manifest.json",manifest)
+    seal_manifest(out,manifest)
     print(json.dumps({"stage":"native","pages":manifest["page_count"]}),flush=True)
 
-def parse(config, out):
+def parse(config, out, source_profile=None):
     import fitz
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
@@ -77,9 +82,17 @@ def parse(config, out):
     if not torch.cuda.is_available():
         raise RuntimeError("Requested GPU is unavailable; refusing a silent CPU fallback")
     print(json.dumps({"gpu":torch.cuda.get_device_name(0),"cuda":torch.version.cuda}),flush=True)
-    source = get_source(config,out)
+    if source_profile:
+        verify_artifact(config,source_profile)
+        profile=json.loads((source_profile/"profile.json").read_text())
+        if not profile["parse_allowed"]:raise ValueError("Source requires OCR or visual review before parsing")
+        source=out/"source.pdf"
+        shutil.copyfile(source_profile/"source.pdf",source)
+    else:
+        if config.get("execution_mode")=="per_document_ingestion":raise ValueError("Dynamic ingestion requires a verified source profile")
+        source = get_source(config,out)
     logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler(out/"conversion.log"),logging.StreamHandler()])
-    options = PdfPipelineOptions(artifacts_path=Path("/opt/rag/models"))
+    options = PdfPipelineOptions(artifacts_path=Path(config.get("model_path","/opt/rag/models")))
     options.do_ocr = False
     options.do_table_structure = True
     options.table_structure_options.mode = TableFormerMode.ACCURATE
@@ -122,7 +135,7 @@ def parse(config, out):
         except (ValueError,IndexError): pass
     manifest["gpu_utilization"]={"sample_interval_ms":200,"samples":len(readings),
         "mean_pct":round(sum(readings)/len(readings),1) if readings else None,"peak_pct":max(readings) if readings else None}
-    dump(out/"manifest.json",manifest)
+    seal_manifest(out,manifest)
     print(json.dumps({k:manifest[k] for k in ["conversion_status","elapsed_seconds","pages_in_source","elements","tables"]}),flush=True)
     if result.status.value not in ("success","partial_success"):
         raise RuntimeError("Docling conversion did not produce a usable candidate")
@@ -130,7 +143,7 @@ def parse(config, out):
 def materialize(config, doc, out, config_id):
     artifact_id=digest((out/"document.json").read_bytes())
     def stable(ref):
-        return digest((config["source_sha256"]+"|"+config_id+"|"+artifact_id+"|"+ref).encode())
+        return digest((str(config.get("document_id") or "")+"|"+config["source_sha256"]+"|"+config_id+"|"+artifact_id+"|"+ref).encode())
     def provenance(item):
         return [p.model_dump(mode="json") for p in item.prov]
     from docling_core.types.doc import ContentLayer
@@ -201,6 +214,7 @@ def materialize(config, doc, out, config_id):
 def reconcile(config, parsed, out):
     from docling_core.types.doc import DoclingDocument
     from preservation import repair_document, build_context_graph, VERSION
+    verify_artifact(config,parsed,canonical=True)
     shutil.copytree(parsed,out,dirs_exist_ok=True)
     canonical=out/"document.json"
     original=out/"original-document.json"
@@ -230,7 +244,7 @@ def reconcile(config, parsed, out):
     manifest.update({"elements":len(elements),"tables":len(tables),"preservation_version":VERSION,
         "original_canonical_sha256":original_hash,"canonical_sha256":digest(canonical.read_bytes()),
         "derivation_sha256":config_id,"reused_gpu_parse":True,"derivation_configuration":config})
-    dump(out/"manifest.json",manifest)
+    seal_manifest(out,manifest)
     print(json.dumps({"stage":"reconcile","canonical_parse_reused":True,"elements":len(elements),
         "table_repairs":len(audit["table_repairs"]),"native_supplements":len(audit["native_supplements"]),
         "list_markers":len(audit["list_markers"]),"context_edges":len(graph["edges"])}),flush=True)
@@ -242,12 +256,13 @@ def chunk(config, parsed, out):
     from docling_core.transforms.serializer.markdown import MarkdownParams, MarkdownTableSerializer
     from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
     from transformers import AutoTokenizer
+    parse_manifest=verify_artifact(config,parsed,canonical=True)
     doc=DoclingDocument.load_from_json(parsed/"document.json")
     element_map={x["ref"]:x for x in json.loads((parsed/"elements.json").read_text())}
     class MDTableSerializerProvider(ChunkingSerializerProvider):
         def get_serializer(self,doc):
             return ChunkingDocSerializer(doc=doc,table_serializer=MarkdownTableSerializer(),params=MarkdownParams(compact_tables=True))
-    raw_tokenizer=AutoTokenizer.from_pretrained("/opt/rag/models/tokenizer",local_files_only=True,trust_remote_code=False)
+    raw_tokenizer=AutoTokenizer.from_pretrained(config.get("tokenizer_path","/opt/rag/models/tokenizer"),local_files_only=True,trust_remote_code=False)
     raw_tokenizer.model_max_length=10**9
     strategies={"hierarchical":HierarchicalChunker(serializer_provider=MDTableSerializerProvider())}
     for budget in config["chunk_budgets"]:
@@ -312,16 +327,20 @@ def chunk(config, parsed, out):
                 "expanded_tokens":len(raw_tokenizer.encode(expanded,add_special_tokens=True)),
                 "expansion_budget":expansion_budget,"deferred_expansion_refs":deferred,
                 "expansion_status":"structural_candidate_unverified"})
-            record["id"]=digest((derivation+"|"+name+"|"+record["contextualized_text"]+"|"+"|".join(record["element_refs"])).encode())
+            record["id"]=digest((str(config.get("document_id") or "")+"|"+derivation+"|"+name+"|"+record["contextualized_text"]+"|"+"|".join(record["element_refs"])).encode())
         dump(out/(name+".json"),output)
         summary[name]={"chunks":len(output),"max_tokens":max((c["tokens_with_special_tokens"] for c in output),default=0),
             "oversized":sum(not c["fits_budget"] for c in output),"unresolved_provenance":sum(not c["provenance_resolved"] for c in output),
             "chunks_sha256":digest(json.dumps(output,sort_keys=True,ensure_ascii=False).encode())}
     dump(out/"summary.json",summary)
-    dump(out/"manifest.json",runtime_manifest(config,"chunk"))
+    chunk_manifest=runtime_manifest(config,"chunk")
+    chunk_manifest["parsed_canonical_sha256"]=parse_manifest["canonical_sha256"]
+    seal_manifest(out,chunk_manifest)
     print(json.dumps(summary),flush=True)
 
 def evaluate(config, native_dir, parsed, chunks, out):
+    verify_artifact(config,native_dir)
+    verify_chunk_binding(config,parsed,chunks)
     client=storage(config)
     for name in ["gold_annotations.json","benchmark_config.json","benchmark.py"]:
         get_kit_file(client,config,name,out/name)
@@ -481,6 +500,51 @@ def evaluate(config, native_dir, parsed, chunks, out):
     dump(out/"manifest.json",runtime_manifest(config,"evaluate"))
     print(json.dumps(scorecard),flush=True)
 
+def preflight(config,out,gate_path):
+    source=get_source(config,out)
+    profile=inspect_pdf(source,config)
+    dump(out/"profile.json",profile)
+    manifest=runtime_manifest(config,"source_profile")
+    manifest.update({"page_count":profile["page_count"],"parse_allowed":profile["parse_allowed"],
+        "review_reasons":profile["review_reasons"],"gold_annotations_consumed":False})
+    seal_manifest(out,manifest)
+    gate_path.parent.mkdir(parents=True,exist_ok=True)
+    gate_path.write_text("true" if profile["parse_allowed"] else "false")
+    print(json.dumps({"stage":"source_profile","document_id":config["document_id"],
+        "pages":profile["page_count"],"parse_allowed":profile["parse_allowed"],"review_reasons":profile["review_reasons"]}),flush=True)
+
+def ingestion_report(config,source_profile,parsed,chunks,out):
+    verify_artifact(config,source_profile)
+    verify_chunk_binding(config,parsed,chunks)
+    profile=json.loads((source_profile/"profile.json").read_text())
+    summary=json.loads((chunks/"summary.json").read_text())
+    elements=json.loads((parsed/"elements.json").read_text())
+    by_ref={e["ref"]:e for e in elements}
+    records=json.loads((chunks/("hybrid_"+str(config["primary_chunk_budget"])+".json")).read_text())
+    refs={r for c in records for r in c["context_refs"]}
+    def covered(e):
+        seen=set()
+        while e and e["ref"] not in seen:
+            if e["ref"] in refs:return True
+            seen.add(e["ref"]);e=by_ref.get(e.get("parent_ref"))
+        return False
+    missing=[e["ref"] for e in elements if e.get("content_layer")=="body" and e["text"].strip() and not covered(e)]
+    ledger=json.loads((parsed/"page-text.json").read_text())
+    missing_pages=[p["page"] for p in profile["pages"] if not p["blank"] and not ledger.get(str(p["page"]),"").strip()]
+    contracts={"no_missing_body_lineage":not missing,"no_unaccounted_content_pages":not missing_pages,
+        "chunks_fit_budgets":all(v["oversized"]==0 for v in summary.values()),
+        "chunk_provenance_resolves":all(v["unresolved_provenance"]==0 for v in summary.values()),
+        "nonempty_chunks":bool(records)}
+    report={"document_id":config["document_id"],"source_sha256":config["source_sha256"],
+        "document_version":config["source_sha256"],"gold_annotations_consumed":False,
+        "release_state":"review_required","indexing_performed":False,"structural_contracts":contracts,
+        "unrepresented_refs":missing,"unaccounted_pages":missing_pages,"chunks":summary,
+        "reason":"Business scope and visual relationships require independent validation."}
+    dump(out/"ingestion-report.json",report)
+    seal_manifest(out,runtime_manifest(config,"ingestion_report"))
+    if not all(contracts.values()):raise RuntimeError("Ingestion structural contract failed; review the report")
+    print(json.dumps(report),flush=True)
+
 def ablate(config,out):
     import gc, torch
     for matching in [True,False]:
@@ -515,19 +579,36 @@ def compare_ablation(config,native_dir,parsed,out):
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument("stage",choices=["native","parse","reconcile","chunk","evaluate","ablate","compare-ablation"])
+    ap.add_argument("stage",choices=["native","parse","reconcile","chunk","evaluate","ablate","compare-ablation","preflight","ingestion-report"])
     ap.add_argument("--config",required=True,type=Path)
     ap.add_argument("--out",required=True,type=Path)
     ap.add_argument("--native",type=Path)
     ap.add_argument("--parsed",type=Path)
     ap.add_argument("--chunks",type=Path)
+    ap.add_argument("--source-key")
+    ap.add_argument("--source-sha256")
+    ap.add_argument("--document-id")
+    ap.add_argument("--dynamic-source",action="store_true")
+    ap.add_argument("--source-profile",type=Path)
+    ap.add_argument("--gate",type=Path)
     args=ap.parse_args()
     cfg=json.loads(args.config.read_text())
+    if args.dynamic_source:
+        cfg=bind_runtime_source(cfg,args.source_key,args.source_sha256,args.document_id)
+    elif any(v is not None for v in (args.source_key,args.source_sha256,args.document_id)):
+        ap.error("Per-upload arguments require --dynamic-source")
+    validate_source(cfg)
     args.out.mkdir(parents=True,exist_ok=True)
-    if args.stage=="ablate":ablate(cfg,args.out)
+    if args.stage=="preflight":
+        if not args.dynamic_source or not args.gate:ap.error("preflight requires runtime source parameters and --gate")
+        preflight(cfg,args.out,args.gate)
+    elif args.stage=="ingestion-report":
+        if not args.dynamic_source:ap.error("ingestion-report requires runtime source parameters")
+        ingestion_report(cfg,args.source_profile,args.parsed,args.chunks,args.out)
+    elif args.stage=="ablate":ablate(cfg,args.out)
     elif args.stage=="compare-ablation":compare_ablation(cfg,args.native,args.parsed,args.out)
     elif args.stage=="native":native(cfg,args.out)
-    elif args.stage=="parse":parse(cfg,args.out)
+    elif args.stage=="parse":parse(cfg,args.out,args.source_profile)
     elif args.stage=="reconcile":reconcile(cfg,args.parsed,args.out)
     elif args.stage=="chunk":chunk(cfg,args.parsed,args.out)
     else:evaluate(cfg,args.native,args.parsed,args.chunks,args.out)

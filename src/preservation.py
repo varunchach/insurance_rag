@@ -6,7 +6,23 @@ VERSION = 1
 DEFAULTS = {"rule_width": 1.0, "table_match_iou": .95,
             "native_margin": 2.0, "continuation_edge": .72,
             "continuation_top": .23, "expansion_tokens": 4096,
-            "expansion_hops": 2, "note_gap": 12.0}
+            "expansion_hops": 2, "note_gap": 12.0,
+            "nested_table_overlap": .5, "missing_table_iou": .1, "minimum_text_retention": .95,
+            "native_table_overlap": .8, "note_overlap": .8, "continuation_width_tolerance": .04}
+
+def validated_options(options=None):
+    options=options or {}
+    unknown=set(options)-set(DEFAULTS)
+    if unknown:raise ValueError("Unknown preservation settings: "+", ".join(sorted(unknown)))
+    result={**DEFAULTS,**options}
+    for name,value in result.items():
+        if not isinstance(value,(int,float)) or isinstance(value,bool) or value<=0:
+            raise ValueError(name+" must be a positive number")
+        if name not in ("rule_width","native_margin","note_gap","expansion_tokens","expansion_hops") and value>1:
+            raise ValueError(name+" must be at most 1")
+    for name in ("expansion_tokens","expansion_hops"):
+        if not isinstance(result[name],int):raise ValueError(name+" must be an integer")
+    return result
 
 def lexical(text):
     """Split alphanumerics consistently; retain signs, decimal points and punctuation."""
@@ -89,7 +105,7 @@ def ruled_data(table):
 def repair_document(doc, source, options=None):
     import pdfplumber
     from docling_core.types.doc import ProvenanceItem, BoundingBox, CoordOrigin, DocItemLabel, ContentLayer
-    opts = {**DEFAULTS, **(options or {})}
+    opts = validated_options(options)
     audit = {"version": VERSION, "options": opts, "gold_annotations_consumed": False,
              "table_repairs": [], "native_supplements": [], "list_markers": []}
     for item in doc.texts:
@@ -111,16 +127,16 @@ def repair_document(doc, source, options=None):
                            if (reg := region(item, doc)) and reg[0] == page.page_number
                            for box in [reg[1]]]
                 overlap, item, box = max(matches, key=lambda v: v[0], default=(0, None, None))
-                nested = any(intersection(candidate.bbox, b)/max(1,area(candidate.bbox)) > .5 for _, _, b in matches)
+                nested = any(intersection(candidate.bbox, b)/max(1,area(candidate.bbox)) > opts["nested_table_overlap"] for _, _, b in matches)
                 reason = None
-                if not nested and overlap < .1:
+                if not nested and overlap < opts["missing_table_iou"]:
                     reason = "ruled_table_missing_from_layout"
                 elif overlap >= opts["table_match_iou"] and data.num_rows == item.data.num_rows and data.num_cols < item.data.num_cols:
                     old = counts(" ".join(c.text for c in item.data.table_cells))
                     new = counts(" ".join(c.text for c in data.table_cells))
                     retained = sum((old & new).values()) / max(1, sum(old.values()))
                     missing_numbers = {k:v for k,v in (old-new).items() if k.isdigit()}
-                    if retained >= .95 and not missing_numbers:
+                    if retained >= opts["minimum_text_retention"] and not missing_numbers:
                         reason = "ruling_boundaries_resolve_spurious_columns"
                 if not reason:
                     continue
@@ -179,7 +195,7 @@ def repair_document(doc, source, options=None):
                         position=idx;break
                 doc.body.children.insert(position,added)
                 candidates = [t.self_ref for t in doc.tables if (loc:=region(t,doc))
-                              and loc[0]==page.page_number and intersection(b,loc[1])/max(1,area(b))>.8]
+                              and loc[0]==page.page_number and intersection(b,loc[1])/max(1,area(b))>opts["native_table_overlap"]]
                 audit["native_supplements"].append({"ref":item.self_ref,"page":page.page_number,
                     "bbox":b,"text":line["text"],"missing_local_tokens":words_missing,
                     "table_candidates":candidates,"cell_assignment":"unverified","source":"native_pdf_line"})
@@ -187,7 +203,7 @@ def repair_document(doc, source, options=None):
 
 def build_context_graph(elements, tables, heights, options=None):
     """Bounded evidence relationships; edges are candidates, never physical table merges."""
-    opts={**DEFAULTS,**(options or {})}
+    opts=validated_options(options)
     edges=[]
     by_ref={e["ref"]:e for e in elements}
     table_map={t["ref"]:t for t in tables}
@@ -205,7 +221,7 @@ def build_context_graph(elements, tables, heights, options=None):
         pp,pb=box(previous);cp,cb=box(current)
         gap=cb[1]-pb[3]
         overlap=max(0,min(pb[2],cb[2])-max(pb[0],cb[0]))/max(1,min(pb[2]-pb[0],cb[2]-cb[0]))
-        return pp==cp and 0<=gap<=opts["note_gap"] and overlap>=.8
+        return pp==cp and 0<=gap<=opts["note_gap"] and overlap>=opts["note_overlap"]
     previous=None
     pending=[]
     for e in body:
@@ -232,7 +248,7 @@ def build_context_graph(elements, tables, heights, options=None):
         if rp!=lp+1 or lt["shape"][1]!=rt["shape"][1]:continue
         if lb[3]<heights[lp]*opts["continuation_edge"] or rb[1]>heights[rp]*opts["continuation_top"]:continue
         width=max(1,lb[2]-lb[0])
-        if max(abs(lb[0]-rb[0]),abs(lb[2]-rb[2]))/width>.04:continue
+        if max(abs(lb[0]-rb[0]),abs(lb[2]-rb[2]))/width>opts["continuation_width_tolerance"]:continue
         intervening=False
         for e in body:
             if e["label"] not in ("title","section_header"):continue

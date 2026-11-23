@@ -29,6 +29,18 @@
     "continuation_top": 0.23,
     "expansion_tokens": 4096,
     "expansion_hops": 2,
-    "note_gap": 12.0
+    "note_gap": 12.0,
+    "nested_table_overlap": 0.5,
+    "missing_table_iou": 0.1,
+    "minimum_text_retention": 0.95,
+    "native_table_overlap": 0.8,
+    "note_overlap": 0.8,
+    "continuation_width_tolerance": 0.04
+  },
+  "input_policy": {
+    "max_source_bytes": 104857600,
+    "max_pages": 1000,
+    "min_native_chars": 20,
+    "review_image_area_ratio": 0.05
   }
 }

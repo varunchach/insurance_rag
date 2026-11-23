@@ -10,7 +10,7 @@ Build containers on OpenShift. Keep credentials in OpenShift Secrets. Do not com
 
 1. Build the pinned CPU runtime using `runtime/Dockerfile.cpu`, then the CUDA runtime using `runtime/Dockerfile.gpu`. Update the GPU Dockerfile's source image reference for your own registry.
 2. Upload a source PDF and independently maintained evaluation kit to approved S3 storage. Set the source SHA-256, fixture checksums, endpoint and object keys in a private configuration derived from `config.example.json`.
-3. Put `src/qualification.py`, `src/preservation.py`, `pipelines/bootstrap.py`, `pipelines/compile_pipeline.py` and the private configuration into a versioned OpenShift ConfigMap. Set `code.sha256` to the SHA-256 of `qualification.py`; set `module.sha256` to a JSON mapping of both Python module names to their SHA-256 hashes. Make the ConfigMap immutable after validation.
+3. Put `src/qualification.py`, `src/preservation.py`, `src/document_contract.py`, `pipelines/bootstrap.py`, `pipelines/compile_pipeline.py` and the private configuration into a versioned OpenShift ConfigMap. Set `code.sha256` to the SHA-256 of `qualification.py`; set `module.sha256` to a JSON mapping of all three Python module names to their SHA-256 hashes. Make the ConfigMap immutable after validation.
 4. Compile on OCP using the installed KFP SDK:
    `python pipelines/compile_pipeline.py /path/config.json pipelines/bootstrap.py /path/output`
 5. Register the resulting pipeline specification with the existing RHOAI pipeline server and execute it. The Docling parsing task requests one `nvidia.com/gpu`; text extraction, chunking and scoring use CPUs. The pipeline service account requires read access to its named ConfigMap and storage Secret.
@@ -50,3 +50,21 @@ The scorecard retains the original numeric disagreement metric and also reports 
 ## Verification
 
 Run python -m unittest discover -s tests -v inside the approved OCP runtime. Synthetic tests cover hierarchy, merged cells, native recovery, literal NA/Nil/blank values, continuation rejection, note direction, numeric signs and decimals, and tokenizer limits. The document benchmark runs separately with independently maintained private fixtures. Keep source documents, annotations, outputs and scorecards out of this repository.
+
+## New uploads and the benchmark are separate entry points
+
+Use pipelines/compile_ingestion.py with a private configuration derived from ingestion.example.json for client uploads. Compile once on OCP:
+
+    python pipelines/compile_ingestion.py /path/deployment-config.json pipelines/bootstrap.py /path/output
+
+Each run requires source_key, source_sha256 and document_id. There are no defaults for these parameters. The upload caller must calculate the SHA-256 of the uploaded bytes, provide an object key in the configured bucket, and enforce access to that object. The input ID is metadata, not an authorization mechanism. An upload API or event trigger is not implemented here; it must submit these required run parameters.
+
+The compiled ingestion DAG contains no saved sample artifact URIs and never reads gold annotations or benchmark scripts. Deployment configuration selects approved storage, images, model paths, resource limits and parsing thresholds. Sample source settings and fixture settings are excluded from the runtime configuration. Run artifacts are separate, and element/chunk IDs include document identity and content/parse hashes.
+
+Before GPU parsing, the source checksum is verified and every page is profiled. Scans and substantial embedded images are held for OCR or visual review using the configured input_policy. This runtime does not yet provide a qualified OCR/image-understanding path. Empty documents are also held for review. In these cases the source-profile artifact records parse_allowed=false and review_reasons, and the GPU branch is skipped. A successful KFP run is not a release decision; consumers must inspect the quality artifact.
+
+Every stage verifies the source identity. Imported artifacts with another source checksum or document ID are rejected, as are altered PDFs, canonical parses and checksummed payload files. Chunk manifests identify the exact parse version that produced them.
+
+The original pipelines/compile_pipeline.py remains a qualification-only entry point. Its fixed source, fixture hashes and optional saved artifacts exist to reproduce a benchmark. Do not use that workflow to handle arbitrary uploads. It now checks source/artifact consistency before reusing inputs.
+
+Thresholds are configurable processing assumptions. Language and numbering heuristics produce unverified structural candidates. They are not client-specific mappings, and they do not establish business scope. Passing synthetic transformations and the original document benchmark does not demonstrate reliability on unseen client PDFs. Review routing remains active until independent document and relationship qualification is complete.

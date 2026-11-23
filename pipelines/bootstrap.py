@@ -8,9 +8,9 @@ with urllib.request.urlopen(req,context=ssl.create_default_context(cafile=str(sa
 root=pathlib.Path("/tmp/rag-code")
 root.mkdir(exist_ok=True)
 module_hashes=json.loads(data["module.sha256"])
-assert set(module_hashes)=={"qualification.py","preservation.py"}, "Incomplete executable manifest"
+assert set(module_hashes)=={"qualification.py","preservation.py","document_contract.py"}, "Incomplete executable manifest"
 for name, expected_hash in module_hashes.items():
-    assert name in ("qualification.py","preservation.py"), "Unexpected executable module"
+    assert name in ("qualification.py","preservation.py","document_contract.py"), "Unexpected executable module"
     assert hashlib.sha256(data[name].encode()).hexdigest()==expected_hash, "Module hash mismatch"
     compile(data[name],name,"exec")
     root.joinpath(name).write_text(data[name],encoding="utf-8")
