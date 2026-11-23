@@ -128,8 +128,9 @@ def parse(config, out):
         raise RuntimeError("Docling conversion did not produce a usable candidate")
 
 def materialize(config, doc, out, config_id):
+    artifact_id=digest((out/"document.json").read_bytes())
     def stable(ref):
-        return digest((config["source_sha256"]+"|"+config_id+"|"+ref).encode())
+        return digest((config["source_sha256"]+"|"+config_id+"|"+artifact_id+"|"+ref).encode())
     def provenance(item):
         return [p.model_dump(mode="json") for p in item.prov]
     from docling_core.types.doc import ContentLayer
@@ -137,16 +138,16 @@ def materialize(config, doc, out, config_id):
     source=out/"source.pdf"
     elements=[]
     tables=[]
+    from preservation import assign_headings
+    hierarchy=assign_headings(doc)
     headings=[]
     pages={i:[] for i in range(1,len(fitz.open(source))+1)}
     for item, depth in doc.iterate_items(with_groups=False, traverse_pictures=True, included_content_layers=set(ContentLayer)):
         label=str(item.label.value)
-        if label in ["title","section_header"]:
-            level=getattr(item,"level",1)
-            while headings and headings[-1]["level"]>=level:
-                headings.pop()
-            headings.append({"level":level,"text":getattr(item,"text",""),"ref":item.self_ref})
+        headings=hierarchy.get(item.self_ref,[])
         text=getattr(item,"text","")
+        marker=getattr(item,"marker","")
+        if marker and not text.lstrip().startswith(marker):text=marker+" "+text
         prov=provenance(item)
         element={"id":stable(item.self_ref),"ref":item.self_ref,"label":label,
             "parent_ref":item.parent.cref if item.parent else None,
@@ -199,15 +200,40 @@ def materialize(config, doc, out, config_id):
 
 def reconcile(config, parsed, out):
     from docling_core.types.doc import DoclingDocument
+    from preservation import repair_document, build_context_graph, VERSION
     shutil.copytree(parsed,out,dirs_exist_ok=True)
-    doc=DoclingDocument.load_from_json(out/"document.json")
+    canonical=out/"document.json"
+    original=out/"original-document.json"
+    if (parsed/"original-document.json").exists():
+        shutil.copyfile(original,canonical)
+    else:
+        shutil.copyfile(canonical,original)
+    original_hash=digest(canonical.read_bytes())
+    doc=DoclingDocument.load_from_json(canonical)
+    audit=repair_document(doc,out/"source.pdf",config.get("preservation",{}))
+    doc.save_as_json(canonical)
+    doc.save_as_markdown(out/"document.md")
+    config_id=digest((original_hash+digest(canonical.read_bytes())+json.dumps(audit["options"],sort_keys=True)).encode())
+    elements,tables,pages=materialize(config,doc,out,config_id)
+    by_ref={e["ref"]:e for e in elements}
+    for record in audit["native_supplements"]:
+        by_ref[record["ref"]]["native_recovery"]=record
+    dump(out/"elements.json",elements)
+    graph=build_context_graph(elements,tables,{p:page.size.height for p,page in doc.pages.items()},config.get("preservation",{}))
+    for record in audit["native_supplements"]:
+        for table_ref in record["table_candidates"]:
+            graph["edges"].append({"source":table_ref,"target":record["ref"],
+                "kind":"native_recovery","status":"cell_assignment_unverified"})
+    dump(out/"context-graph.json",graph)
+    dump(out/"preservation-audit.json",audit)
     manifest=json.loads((out/"manifest.json").read_text())
-    elements,tables,pages=materialize(config,doc,out,manifest["parser_configuration_sha256"])
-    manifest.update({"elements":len(elements),"tables":len(tables),"derived_accounting_version":2,
-        "reused_gpu_parse":True,"derivation_configuration":config})
+    manifest.update({"elements":len(elements),"tables":len(tables),"preservation_version":VERSION,
+        "original_canonical_sha256":original_hash,"canonical_sha256":digest(canonical.read_bytes()),
+        "derivation_sha256":config_id,"reused_gpu_parse":True,"derivation_configuration":config})
     dump(out/"manifest.json",manifest)
     print(json.dumps({"stage":"reconcile","canonical_parse_reused":True,"elements":len(elements),
-        "pages_with_text":sum(bool("\n".join(v).strip()) for v in pages.values())}),flush=True)
+        "table_repairs":len(audit["table_repairs"]),"native_supplements":len(audit["native_supplements"]),
+        "list_markers":len(audit["list_markers"]),"context_edges":len(graph["edges"])}),flush=True)
 
 def chunk(config, parsed, out):
     from docling_core.types.doc import DoclingDocument
@@ -229,6 +255,10 @@ def chunk(config, parsed, out):
         tokenizer=HuggingFaceTokenizer(tokenizer=raw_tokenizer,max_tokens=budget-raw_tokenizer.num_special_tokens_to_add(False))
         strategies["hybrid_"+str(budget)]=HybridChunker(tokenizer=tokenizer,repeat_table_header=True,
             serializer_provider=MDTableSerializerProvider(),merge_peers=True)
+    from preservation import expand_refs, split_text
+    graph=json.loads((parsed/"context-graph.json").read_text()) if (parsed/"context-graph.json").exists() else {"edges":[],"options":{}}
+    expansion_budget=config.get("preservation",{}).get("expansion_tokens",4096)
+    derivation=json.loads((parsed/"manifest.json").read_text()).get("canonical_sha256","")
     summary={}
     for name,chunker in strategies.items():
         output=[]
@@ -252,6 +282,37 @@ def chunk(config, parsed, out):
                 "parent_expansion_refs":context_refs,"release_state":"review_required"}
             payload["id"]=digest((config["source_sha256"]+"|"+name+"|"+str(i)+"|"+context+"|"+"|".join(refs)).encode())
             output.append(payload)
+        # Emit standalone chunks for body text that a serializer excludes (often headings).
+        covered={r for record in output for r in record["context_refs"]}
+        def represented(element):
+            seen=set()
+            while element and element["ref"] not in seen:
+                if element["ref"] in covered:return True
+                seen.add(element["ref"])
+                element=element_map.get(element.get("parent_ref"))
+            return False
+        budget=int(name.split("_")[1]) if name.startswith("hybrid_") else None
+        for e in element_map.values():
+            if e.get("content_layer")!="body" or not e["text"].strip() or represented(e):continue
+            # Split text while preserving source references and the actual tokenizer contract.
+            pieces=split_text(e["text"],raw_tokenizer,budget)
+            for piece in pieces:
+                count=len(raw_tokenizer.encode(piece,add_special_tokens=True))
+                pages=sorted({p["page_no"] for p in e["provenance"]})
+                output.append({"strategy":name,"text":piece,"contextualized_text":piece,
+                    "element_refs":[e["ref"]],"element_ids":[e["id"]],"context_refs":[e["ref"]],
+                    "body_pages":pages,"context_pages":pages,"headings":[],
+                    "tokens_with_special_tokens":count,"budget":budget,"fits_budget":budget is None or count<=budget,
+                    "provenance_resolved":True,"metadata":{"preservation_fallback":True},
+                    "release_state":"review_required"})
+        for record in output:
+            refs,expanded,deferred=expand_refs(record["context_refs"],graph,element_map,raw_tokenizer,
+                expansion_budget,config.get("preservation",{}).get("expansion_hops",2))
+            record.update({"parent_expansion_refs":refs,"expanded_text":expanded,
+                "expanded_tokens":len(raw_tokenizer.encode(expanded,add_special_tokens=True)),
+                "expansion_budget":expansion_budget,"deferred_expansion_refs":deferred,
+                "expansion_status":"structural_candidate_unverified"})
+            record["id"]=digest((derivation+"|"+name+"|"+record["contextualized_text"]+"|"+"|".join(record["element_refs"])).encode())
         dump(out/(name+".json"),output)
         summary[name]={"chunks":len(output),"max_tokens":max((c["tokens_with_special_tokens"] for c in output),default=0),
             "oversized":sum(not c["fits_budget"] for c in output),"unresolved_provenance":sum(not c["provenance_resolved"] for c in output),
@@ -296,6 +357,7 @@ def evaluate(config, native_dir, parsed, chunks, out):
             queue.append({"kind":"annotated_table_mismatch","severity":"high","fixture":score["id"],"page":score["page"],
                 "actual_shape":score["actual_shape"],"expected_shape":score["expected_shape"],
                 "failed_rows":[r["expected"] for r in score["rows"] if not r["pass"]]})
+    from preservation import lexical
     page_scores=[]
     for p in baseline_text:
         expected=collections.Counter(tokens(p["pypdf"]))
@@ -307,7 +369,9 @@ def evaluate(config, native_dir, parsed, chunks, out):
             "token_multiset_recall":overlap/max(1,sum(expected.values())),
             "token_multiset_f1":2*overlap/max(1,sum(expected.values())+sum(actual.values())),
             "missing_native_numeric_tokens":numeric})
-        if numeric:
+        normalized_missing=collections.Counter(lexical(p["pypdf"]))-collections.Counter(lexical(doc_text.get(str(p["page"]),"")))
+        page_scores[-1]["missing_normalized_numeric_tokens"]=[{"token":k,"missing_occurrences":v} for k,v in normalized_missing.items() if k.isdigit()]
+        if page_scores[-1]["missing_normalized_numeric_tokens"]:
             queue.append({"kind":"native_numeric_omission_candidate","severity":"high","page":p["page"],"missing":numeric,
                 "reason":"Independent parser disagreement; inspect source before treating as a confirmed extraction error."})
     dump(out/"page-comparison.json",page_scores)
@@ -363,7 +427,7 @@ def evaluate(config, native_dir, parsed, chunks, out):
                 if all(norm(a["text"]) in norm(c["contextualized_text"]) and eligible(a,refs) for a in g["anchors"]):
                     direct.append(c["id"])
                 # Parent expansion explicitly restores full originating elements, not arbitrary neighboring pages.
-                if all(eligible(a,c["parent_expansion_refs"]) for a in g["anchors"]):
+                if all(eligible(a,c["parent_expansion_refs"]) and norm(a["text"]) in norm(c.get("expanded_text","")) for a in g["anchors"]):
                     expanded.append(c["id"])
             chunk_results.append({"id":g["id"],"strategy":strategy,"evidence_colocated":bool(direct),
                 "parent_expansion_colocated":bool(expanded),"matching_chunks":direct[:3],
@@ -389,11 +453,15 @@ def evaluate(config, native_dir, parsed, chunks, out):
         "source_pages":len(baseline_text),"docling_pages":len(json.loads((parsed/"manifest.json").read_text())["pages_in_docling"]),
         "pages_without_docling_text":[p["page"] for p in page_scores if p["docling_chars"]==0],
         "pages_with_numeric_disagreements":sum(bool(p["missing_native_numeric_tokens"]) for p in page_scores),
+        "pages_with_normalized_numeric_disagreements":sum(bool(p["missing_normalized_numeric_tokens"]) for p in page_scores),
         "accounting_includes_furniture_and_picture_children":True,
         "chunks":{s:{**v,"evidence_colocated":sum(x["evidence_colocated"] for x in chunk_results if x["strategy"]==s),
             "parent_expansion_colocated":sum(x["parent_expansion_colocated"] for x in chunk_results if x["strategy"]==s),
             "evidence_cases":len(gold["evidence_dependencies"])} for s,v in summary.items()},
         "review_items":len(queue),"continuation_candidates":len(continuation),
+        "candidate_name":"Docling accurate with native preservation",
+        "normalized_numeric_method":"Alphanumeric splitting; punctuation retained. Multiset coverage is not value-to-cell validation.",
+        "expansion_method":"Bounded structural graph; candidate associations remain unverified",
         "limitations":["One PDF with provisional annotations; no unseen-document validation.",
             "Shape and normalized complete-row checks do not validate merged cells or business relationships.",
             "Numeric disagreements are review candidates, not verified errors.",
@@ -403,9 +471,9 @@ def evaluate(config, native_dir, parsed, chunks, out):
     dump(out/"scorecard.json",scorecard)
     lines=["# Docling ingestion qualification","", "Release state: **review required**. Nothing indexed.","",
         "| Candidate | Exact table dimensions | Complete row strings |","|---|---:|---:|"]
-    for name,score in [*scorecard["baseline"].items(),("Docling accurate",scorecard["docling"])]:
+    for name,score in [*scorecard["baseline"].items(),(scorecard["candidate_name"],scorecard["docling"])]:
         lines.append(f"| {name} | {score['exact_dimensions']}/{score['tables']} | {score['complete_rows']}/{score['row_checks']} |")
-    lines+=["","| Chunker | Chunks | Evidence co-location | With originating-element expansion | Oversized |","|---|---:|---:|---:|---:|"]
+    lines+=["","| Chunker | Chunks | Evidence co-location | With bounded context expansion | Oversized |","|---|---:|---:|---:|---:|"]
     for name,score in scorecard["chunks"].items():
         lines.append(f"| {name} | {score['chunks']} | {score['evidence_colocated']}/{score['evidence_cases']} | {score['parent_expansion_colocated']}/{score['evidence_cases']} | {score['oversized']} |")
     lines+=["",f"Pages: {scorecard['docling_pages']}/{scorecard['source_pages']}. Review items: {len(queue)}.",""]+["- "+x for x in scorecard["limitations"]]
@@ -432,8 +500,11 @@ def compare_ablation(config,native_dir,parsed,out):
         chunks.mkdir(parents=True,exist_ok=True)
         report.mkdir(parents=True,exist_ok=True)
         case_config=dict(config,cell_matching=(name=="matching_on"))
-        chunk(case_config,parsed/name,chunks)
-        evaluate(case_config,native_dir,parsed/name,chunks,report)
+        repaired=case_out/"repaired"
+        repaired.mkdir(parents=True,exist_ok=True)
+        reconcile(case_config,parsed/name,repaired)
+        chunk(case_config,repaired,chunks)
+        evaluate(case_config,native_dir,repaired,chunks,report)
         score=json.loads((report/"scorecard.json").read_text())
         manifest=json.loads((parsed/name/"manifest.json").read_text())
         summaries[name]={"scorecard":score,"parse_seconds":manifest["elapsed_seconds"],

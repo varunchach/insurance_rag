@@ -20,5 +20,15 @@
     512
   ],
   "primary_chunk_budget": 512,
-  "accelerator": "cuda"
+  "accelerator": "cuda",
+  "preservation": {
+    "rule_width": 1.0,
+    "table_match_iou": 0.95,
+    "native_margin": 2.0,
+    "continuation_edge": 0.72,
+    "continuation_top": 0.23,
+    "expansion_tokens": 4096,
+    "expansion_hops": 2,
+    "note_gap": 12.0
+  }
 }

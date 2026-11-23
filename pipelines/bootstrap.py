@@ -7,7 +7,14 @@ with urllib.request.urlopen(req,context=ssl.create_default_context(cafile=str(sa
     data=json.load(r)["data"]
 root=pathlib.Path("/tmp/rag-code")
 root.mkdir(exist_ok=True)
-for name in ["qualification.py","config.json"]:
+module_hashes=json.loads(data["module.sha256"])
+assert set(module_hashes)=={"qualification.py","preservation.py"}, "Incomplete executable manifest"
+for name, expected_hash in module_hashes.items():
+    assert name in ("qualification.py","preservation.py"), "Unexpected executable module"
+    assert hashlib.sha256(data[name].encode()).hexdigest()==expected_hash, "Module hash mismatch"
+    compile(data[name],name,"exec")
+    root.joinpath(name).write_text(data[name],encoding="utf-8")
+for name in ["config.json"]:
     root.joinpath(name).write_text(data[name],encoding="utf-8")
 expected=data["code.sha256"]
 assert hashlib.sha256(data["qualification.py"].encode()).hexdigest()==expected, "Code hash mismatch"

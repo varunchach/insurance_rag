@@ -10,7 +10,7 @@ Build containers on OpenShift. Keep credentials in OpenShift Secrets. Do not com
 
 1. Build the pinned CPU runtime using `runtime/Dockerfile.cpu`, then the CUDA runtime using `runtime/Dockerfile.gpu`. Update the GPU Dockerfile's source image reference for your own registry.
 2. Upload a source PDF and independently maintained evaluation kit to approved S3 storage. Set the source SHA-256, fixture checksums, endpoint and object keys in a private configuration derived from `config.example.json`.
-3. Put `src/qualification.py`, `pipelines/bootstrap.py`, `pipelines/compile_pipeline.py` and the private configuration into a versioned OpenShift ConfigMap. Set `code.sha256` to the SHA-256 of `qualification.py`; make the ConfigMap immutable after validation.
+3. Put `src/qualification.py`, `src/preservation.py`, `pipelines/bootstrap.py`, `pipelines/compile_pipeline.py` and the private configuration into a versioned OpenShift ConfigMap. Set `code.sha256` to the SHA-256 of `qualification.py`; set `module.sha256` to a JSON mapping of both Python module names to their SHA-256 hashes. Make the ConfigMap immutable after validation.
 4. Compile on OCP using the installed KFP SDK:
    `python pipelines/compile_pipeline.py /path/config.json pipelines/bootstrap.py /path/output`
 5. Register the resulting pipeline specification with the existing RHOAI pipeline server and execute it. The Docling parsing task requests one `nvidia.com/gpu`; text extraction, chunking and scoring use CPUs. The pipeline service account requires read access to its named ConfigMap and storage Secret.
@@ -34,3 +34,19 @@ The sample operator-managed MinIO and MariaDB used during qualification are deve
 - [PyTorch CUDA wheels](https://pytorch.org/get-started/previous-versions/)
 
 The optional GPU comparison is compiled with pipelines/compile_ablation.py using the same arguments. It runs matching on and off consecutively, records GPU utilization every 200 ms, and evaluates both outputs. Larger batches are configurable and must be assessed by elapsed time and quality, not peak utilization alone.
+
+## Preservation stage
+
+Every new or imported parse passes through reconcile before chunking. original-document.json retains the original model output. document.json is the derived representation; the manifest binds both hashes and the repair configuration. A rerun begins from the saved original, so recoveries do not accumulate.
+
+The stage reconstructs missing ruled tables and accepts a narrower ruled structure only when row counts agree, geometry overlaps, and native text retains the original tokens and numbers. Native lines missing from local parser regions are retained separately with page coordinates. Their table references are candidates; no cell assignment is invented. preservation-audit.json records original table data, recovery reasons, list markers and native snippets.
+
+Numbered headings and consecutive heading groups retain ancestry. Standalone fallback chunks preserve body elements omitted by the serializer. context-graph.json records heading, nearby-note, preceding-section and cross-page table candidates. Table segments remain separate. Expanded evidence has a configurable token budget and hop limit, and deferred references are explicit. Candidate relationships do not establish product ownership, effective-date precedence or exception applicability.
+
+config.example.json lists the geometric thresholds and expansion limits under preservation. They are general document rules; production code does not read page-specific annotations or expected answers. Supply parsed_artifact_uri to reuse a GPU parse for CPU-only preservation changes.
+
+The scorecard retains the original numeric disagreement metric and also reports coverage after alphanumeric splitting. This treats split ordinal suffixes consistently while retaining punctuation in the comparison. Numeric multiset coverage cannot prove that a value belongs to the correct cell.
+
+## Verification
+
+Run python -m unittest discover -s tests -v inside the approved OCP runtime. Synthetic tests cover hierarchy, merged cells, native recovery, literal NA/Nil/blank values, continuation rejection, note direction, numeric signs and decimals, and tokenizer limits. The document benchmark runs separately with independently maintained private fixtures. Keep source documents, annotations, outputs and scorecards out of this repository.
