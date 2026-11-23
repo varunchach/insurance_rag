@@ -1,0 +1,5 @@
+FROM image-registry.openshift-image-registry.svc:5000/rag-ingestion/rag-docling-runtime@sha256:48774f38c7807d9b6bb9a4c424cd5e42f0e6d79cd2b34e4403c18e8183f2a883
+USER 0
+RUN python -m pip install --index-url https://download.pytorch.org/whl/cu128 --report /opt/rag/gpu-pip-install-report.json torch==2.10.0+cu128 torchvision==0.25.0+cu128 && python -m pip check && python -m pip freeze > /opt/rag/requirements.lock
+RUN chmod -R a+rX /opt/rag /opt/rag-venv
+USER 1001
